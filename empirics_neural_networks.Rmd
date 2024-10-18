@@ -1,0 +1,439 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+# Load library
+```{r}
+rm(list = ls())
+library(dplyr)
+library(magrittr)
+library(purrr)
+library(pROC)
+library(xgboost)
+library(caret)
+library(reshape2)
+library(ggplot2)
+library(torch)
+```
+
+# Load data and split sample with 80% training and 20% testing
+```{r}
+set.seed(10)
+torch::torch_manual_seed(10)
+
+data_0 = read.csv('full_data_chapter_statute_degree_people.csv')
+data_0$race[data_0$race == 'Native American'] = 'Other'
+data_0$af_ind = ifelse(data_0$race == "African-American", 1, 0)
+
+X = cbind(data_0[, 57:828],
+          decile_score = data_0$decile_score,
+          data_0[, c('age', 'juv_fel_count', "juv_misd_count", 'juv_other_count',
+                     "age_25.to.45", "age_Greater.than.45", "age_Less.than.25", "sex_female",
+                     "mariage_Divorced", "mariage_Married", "mariage_Separated",        
+                     "mariage_Significant.Other", "mariage_Single", "mariage_Unknown",
+                     "mariage_Widowed")],
+          af_ind = data_0$af_ind
+          )
+Y = data_0$is_recid
+id_split = runif(length(Y)) > 0.8
+Y_train = Y[!id_split]
+Y_test = Y[id_split]
+X_train = X[!id_split, ]
+X_test = X[id_split, ]
+data_train = data_0[!id_split, ]
+data_test = data_0[id_split, ]
+
+x_train_t <- torch_tensor(as.matrix(X_train), dtype = torch_float32())
+y_train_t <- torch_tensor(as.matrix(Y_train), dtype = torch_float32())
+x_test_t <- torch_tensor(as.matrix(X_test), dtype = torch_float32())
+y_test_t <- torch_tensor(as.matrix(Y_test), dtype = torch_float32())
+```
+
+# Define the deep learning model
+```{r}
+# Define the TwoLayerNN module
+TwoLayerNN <- nn_module(
+  "TwoLayerNN",
+  initialize = function(input_size, hidden_size, output_size) {
+    self$fc1 <- nn_linear(input_size, hidden_size)
+    self$fc2 <- nn_linear(hidden_size, hidden_size)
+    self$fc3 <- nn_linear(hidden_size, output_size)
+  },
+  
+  forward = function(x) {
+    x <- nnf_relu(self$fc1(x))
+    x <- nnf_relu(self$fc2(x))
+    x <- torch_sigmoid(self$fc3(x))
+    return(x)
+  }
+)
+
+# Parameters
+input_size <- 789
+hidden_size <- 200
+output_size <- 1
+```
+
+# Fit symmetric deep learning model without any weights
+```{r}
+# Model instance
+model1 <- TwoLayerNN(input_size, hidden_size, output_size)
+
+# Loss function
+criterion1 <- nn_bce_loss()
+
+# Optimizer
+optimizer1 <- optim_adam(model1$parameters, lr = 0.005)
+
+# Training parameters
+num_epochs <- 20
+
+roc_auc_score <- function(y_true, y_pred) {
+  roc_obj <- roc(y_true, as.numeric(y_pred))
+  auc(roc_obj)
+}
+
+for (epoch in 1:num_epochs) {
+  # Forward pass
+  outputs <- model1(x_train_t)
+  
+  loss1 <- criterion1(outputs, y_train_t)
+  
+  # Backward and optimize
+  optimizer1$zero_grad()
+  
+  loss1$backward()
+  
+  optimizer1$step()
+
+  if (epoch %% 1 == 0) {
+    cat(sprintf("Epoch [%d/%d], Loss: %.4f\n", epoch, num_epochs, loss1$item()))
+    
+  with_no_grad({
+  
+    outputs_test1 <- model1(x_test_t)
+  
+    auc <- roc_auc_score(as_array(y_test_t), as_array(outputs_test1))
+  
+    cat(sprintf("AUC: %.4f\n", auc))
+  })
+  }
+}
+
+```
+
+## AUC and FP/FN for symmetric classifier
+```{r}
+source('model_infer.R')
+
+res1 = 
+model_infer(X, Y, 
+            data_0$race, 
+            id_split, 
+            rep(1, length(data_0$race)), 
+            model1, 
+            cx = rep(0.5, length(data_0$race))
+            )
+
+library(stargazer)
+results <- rbind(1 - res1$conf_mtxrm$test[, 2:1], 1 - res1$conf_mtx$test[2:1])
+results <- cbind(results, c(res1$aucrm$test, res1$aucs$test))
+colnames(results) <- c('FP', 'FN', 'AUC')
+rownames(results) <- c('African-American', 'Other', 'All')
+results
+
+# Print to LaTeX
+stargazer(results, type = "latex")
+
+```
+# Fit asymmetric binary choice models
+## Step 1: tune the model to get balanced false positive and false negative rates
+```{r}
+source('model_infer.r')
+
+res_list_nn = list()
+
+L_1_1  = 0 # cost of true positive
+L_1_m1 = 1 # cost of false positive
+L_m1_m1 = 0 # cost of true negative
+
+L_m1_1_list = c(0, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 3.5, 4)
+
+for (L_m1_1 in L_m1_1_list) {
+  
+  ax =  L_m1_1 - L_1_1 -  (L_1_m1 - L_m1_m1)
+  
+  bx =  L_m1_1 - L_1_1 + L_1_m1 - L_m1_m1
+  
+  cx = (L_1_m1 - L_m1_m1) / (L_1_m1 - L_m1_m1 + L_m1_1 - L_1_1)
+  
+  w = (ifelse(data_0$is_recid == 1, 1, -1) )*ax + bx
+  
+  w_train = w[!id_split]
+  
+  w_test = w[id_split]
+  
+  model_1_nn_weight <- train_nn_model(w_train)
+  
+  res_list_nn[[length(res_list_nn) + 1]] = model_infer(X, Y, data_0$race, 
+                                                 id_split, w, 
+                                                 model_1_nn_weight, 
+                                                 cx = rep(0.5, length(data_0$race)))
+}
+```
+
+# We can reduce the FN rate substantially  with a modest FP price for psi=2.5
+```{r}
+conf_mtx_all = purrr::map_df(res_list_nn, ~ .x$conf_mtx$test)
+fnr_fpr_all = data.frame(FN = 1-conf_mtx_all$Sensitivity, FP =  1-conf_mtx_all$Specificity, cfn = L_m1_1_list) %>% melt(id.vars = 'cfn')
+
+pdf("fig_fp_fn_curves_deep_learning.pdf", width = 7, height = 5)
+ggplot(data = fnr_fpr_all, mapping = aes(x = cfn, y = value, color = variable)) +
+      geom_line(size=1) + 
+      xlab('Cost of False Negative,'~psi) +
+      ylab('FP/FN Rates') + 
+      theme_minimal()
+dev.off()
+```
+# Plot race-specific FP/FN mistakes
+```{r}
+fnr_fpr_race = 
+do.call(
+  rbind,
+purrr::map2(res_list_nn, L_m1_1_list, 
+           ~ data.frame(race = .x$conf_mtxrm$test[, 'Specificity'] %>% names,
+                        fnr  = 1-.x$conf_mtxrm$test[, 'Sensitivity'] %>% unname, 
+                        fpr = 1-.x$conf_mtxrm$test[, 'Specificity'] %>% unname, 
+                        cfnr = .y)
+            )
+  
+)
+
+pdf("fig_fn_race_deep_learning.pdf", width = 7, height = 5)
+ggplot(data = fnr_fpr_race, mapping = aes(x = cfnr, y = fnr, color = race)) + 
+      geom_line(size=1) + 
+      xlab('Cost of False Negative,'~psi) +
+      ylab('False Negative Rates') + 
+      theme_minimal()
+dev.off()
+```
+```{r}
+pdf("fig_fp_race_deep_learning.pdf", width = 7, height = 5)
+ggplot(data = fnr_fpr_race, mapping = aes(x = cfnr, y = fpr, color = race)) + 
+      geom_line(size=1) + 
+      xlab('Cost of False Negative,'~psi) +
+      ylab('False Positive Rates') + 
+      theme_minimal()
+dev.off()
+
+```
+## Step 2. Tune the balanced model to get equal false positive and negative rates
+## Add residual connection
+```{r}
+# Define the TwoLayerNN2 module
+TwoLayerNN2 <- nn_module(
+  "TwoLayerNN",
+  initialize = function(input_size, hidden_size, output_size) {
+    self$fc1 <- nn_linear(input_size, hidden_size)
+    self$fc2 <- nn_linear(hidden_size, hidden_size)
+    self$fc3 <- nn_linear(hidden_size, output_size)
+    
+    self$fc4 = nn_linear(1, 1, bias = FALSE)
+  },
+  
+  forward = function(x) {
+    x1 <- nnf_relu(self$fc1(x))
+    x2 <- nnf_relu(self$fc2(x1))
+    x3 <- torch_sigmoid(self$fc3(x2) + self$fc4(x[, input_size]$unsqueeze(2)))
+    return(x3)
+  }
+)
+
+# Parameters
+input_size <- 789
+hidden_size <- 200
+output_size <- 1
+```
+
+## Step 2. Tune the asymmetric model to get balanced false positive and negative rates
+```{r}
+L_1_1  = 0 # cost of true positive
+L_1_m1 = 1 # cost of false positive
+L_m1_m1 = 0 # cost of true negative
+
+L_m1_1 = 2.5
+
+set.seed(10)
+
+torch::torch_manual_seed(10)
+
+L_m1_1_v = rep(L_m1_1, dim(data_0)[1])*ifelse(data_0$af_ind == TRUE, 1, 1)
+
+L_1_m1_v = rep(L_1_m1, dim(data_0)[1])*ifelse(data_0$af_ind == TRUE, 1, 1) # 1.85 equalizes
+
+ax =  L_m1_1_v - L_1_1 -  (L_1_m1_v - L_m1_m1)
+
+bx =  L_m1_1_v - L_1_1 + L_1_m1_v - L_m1_m1
+
+cx = (L_1_m1_v - L_m1_m1) / (L_1_m1_v - L_m1_m1 + L_m1_1_v - L_1_1)
+
+w = (ifelse(data_0$is_recid == 1, 1, -1) )*ax + bx
+
+w_train = w[!id_split]
+
+w_test = w[id_split]
+
+
+# Model instance
+model_base <- TwoLayerNN2(input_size, hidden_size, output_size)  
+
+w_nn_t = torch_tensor(as.matrix(w_train), dtype = torch_float32())
+
+# Loss function
+criterion <- nn_bce_loss(weight = w_nn_t)
+
+# Optimizer
+optimizer <- optim_adam(model_base$parameters, lr = 0.005)
+
+num_epochs <- 20
+
+for (epoch in 1:num_epochs) {
+  # Forward pass
+  outputs <- model_base(x_train_t)
+  
+  loss <- criterion(outputs, y_train_t)
+  
+  # Backward and optimize
+  optimizer$zero_grad()
+  
+  loss$backward()
+  
+  optimizer$step()
+}
+
+res_list_nnk = model_infer(X, Y, data_0$race, 
+                           id_split, w, 
+                           model_base, 
+                           cx = rep(0.5, length(data_0$race)))
+
+
+results <- rbind(1 - res_list_nnk$conf_mtxrm$test[, 2:1], 1 - res_list_nnk$conf_mtx$test[2:1])
+results <- cbind(results, c(res_list_nnk$aucrm$test, res_list_nnk$aucs$test))
+colnames(results) <- c('FP', 'FN', 'AUC')
+rownames(results) <- c('African-American', 'Other', 'All')
+results
+
+# Print to LaTeX
+stargazer(results, type = "latex")
+```
+
+# Step 3. Fit the asymmetric model with balanced group-specific false positive rates
+```{r}
+source('model_infer.r')
+
+L_1_1  = 0 # cost of true positive
+L_1_m1 = 1 # cost of false positive
+L_m1_m1 = 0 # cost of true negative
+
+res_list_nn3 = list()
+
+L_m1_1 = 2.5 # cost of false negative
+
+af_ind = (data_0$race == "African-American")
+
+multiplier_list = seq(1, 2, 0.1)
+
+for (multiplier in multiplier_list)
+{
+  L_m1_1_v = rep(L_m1_1, dim(data_0)[1])*ifelse(af_ind == TRUE, 1, 1)
+
+  L_1_m1_v = rep(L_1_m1, dim(data_0)[1])*ifelse(af_ind == TRUE, multiplier, 1)
+  
+  ax =  L_m1_1_v - L_1_1 -  (L_1_m1_v - L_m1_m1)
+  
+  bx =  L_m1_1_v - L_1_1 + L_1_m1_v - L_m1_m1
+  
+  cx = (L_1_m1_v - L_m1_m1) / (L_1_m1_v - L_m1_m1 + L_m1_1_v - L_1_1)
+  
+  w = (ifelse(data_0$is_recid == 1, 1, -1) )*ax + bx
+  
+  w_train = w[!id_split]
+  
+  w_test = w[id_split]
+  
+  torch::torch_manual_seed(10)
+
+  model_new <- TwoLayerNN2(input_size, hidden_size, output_size)  
+  
+  model_new$load_state_dict(model_base$state_dict())
+  
+  torch::torch_manual_seed(10)
+  
+  w_nn_t = torch_tensor(as.matrix(w_train), dtype = torch_float32())
+  
+  # Loss function
+  criterion_new <- nn_bce_loss(weight = w_nn_t)
+  
+  # Optimizer
+  optimizer_new2 <- optim_adam(model_new$fc4$parameters, lr = 0.1)
+  
+  num_epochs <- 20
+  
+  for (epoch in 1:num_epochs) {
+    # Forward pass
+    outputs <- model_new(x_train_t)
+    
+    loss_new <- criterion_new(outputs, y_train_t)
+    
+    # Backward and optimize
+    # optimizer_new1$zero_grad()
+    optimizer_new2$zero_grad()
+    
+    loss_new$backward()
+    
+    # optimizer_new1$step()
+    optimizer_new2$step()
+  }
+  
+  res_list_nn3[[length(res_list_nn3) + 1]] = model_infer(X, Y, data_0$race, 
+                                                 id_split, w, 
+                                                 model_new, 
+                                                 cx = rep(0.5, length(data_0$race)))
+
+}
+```
+# Plots
+```{r}
+tpr_tnr_race3 = 
+do.call(rbind,
+purrr::map2(res_list_nn3, multiplier_list, 
+           ~ data.frame(race = .x$conf_mtxrm$test[, 'Specificity'] %>% names,
+                        fnr  = 1-.x$conf_mtxrm$test[, 'Sensitivity'] %>% unname, 
+                        fpr = 1-.x$conf_mtxrm$test[, 'Specificity'] %>% unname, 
+                        cfnr = .y)
+            )
+  
+)
+
+pdf("fig_equalizing_rates_fp_deep_learning.pdf", width = 7, height = 5)
+ggplot(data = tpr_tnr_race3, mapping = aes(x = cfnr, y = fpr, color = race))+
+       geom_line(size=1) +
+       xlab(expression('Cost of False Positive for AF, '*varphi[1])) +
+       ylab('False Positive Rate') + 
+       theme_minimal()
+dev.off()
+
+pdf("fig_equalizing_rates_fn_deep_learning.pdf", width = 7, height = 5)
+ggplot(data = tpr_tnr_race3, mapping = aes(x = cfnr, y = fnr, color = race)) + 
+        geom_line(size=1) +
+        xlab(expression('Cost of False Positive for AF, '*varphi[1])) +
+        ylab('False Negative Rate') + 
+        theme_minimal()
+dev.off()
+```
+
+
+
+
+
+

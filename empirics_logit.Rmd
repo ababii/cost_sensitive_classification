@@ -1,0 +1,454 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+# Load Library
+```{r}
+rm(list = ls())
+library(dplyr)
+library(magrittr)
+library(purrr)
+library(pROC)
+library(xgboost)
+library(caret)
+library(glmnet)
+library(lightgbm)
+library(reshape2)
+library(stargazer)
+```
+
+# Load data
+```{r}
+data_0 = read.csv('full_data_chapter_statute_degree_people.csv')
+dim(data_0)
+
+data_sum <- data_0[, 829:dim(data_0)[2]]
+data_sum$race <- as.factor(data_sum$race)
+data_sum$sex <- as.factor(data_sum$sex)
+summary(data_sum)
+dim(data_0)[1] - sum(data_0$is_recid)
+
+```
+# Merge groups and create X and Y
+```{r}
+data_0$race %>% table
+data_0$af_ind = ifelse(data_0$race == "African-American", 1, 0)
+
+X = cbind(data_0[, 57:828],
+          decile_score = data_0$decile_score,
+          data_0[, c('age', 'juv_fel_count', "juv_misd_count", 'juv_other_count',
+                     "age_25.to.45", "age_Greater.than.45", "age_Less.than.25", "sex_female",
+                     "mariage_Divorced", "mariage_Married", "mariage_Separated",        
+                     "mariage_Significant.Other", "mariage_Single", "mariage_Unknown",
+                     "mariage_Widowed")],
+          af_ind = data_0$af_ind
+          )
+
+Y = data_0$is_recid
+
+```
+
+# Sample data: 80% training, 20% testing
+```{r}
+set.seed(10)
+
+id_split = runif(length(Y)) > 0.8
+Y_train = Y[!id_split]
+Y_test = Y[id_split]
+X_train = X[!id_split, ]
+X_test = X[id_split, ]
+data_train = data_0[!id_split, ]
+data_test = data_0[id_split, ]
+
+X_train %>% dim
+X %>% colnames
+```
+
+# Fit symmetric classifier with LASSO Logit with 5-fold CV
+```{r}
+# takes a minute
+
+system.time(
+  
+  model1 <- cv.glmnet(as.matrix(X_train), Y_train, 
+                      # family = "binomial", 
+                      family = binomial(link = 'logit'),
+                    alpha = 1,
+                    nfolds = 5)  
+  
+)
+```
+
+# Pick the optimal model and check the out-of-sample AUC
+```{r}
+all_coef = coef(model1, model1$lambda)
+all_coef %>% dim
+var_list = purrr::map(model1$lambda[2:length(model1$lambda)],
+                      ~ rownames(all_coef)[which(coef(model1, s = .x) != 0)]
+              ) %>% unique
+var_list %>% length
+```
+
+
+```{r}
+# about 30 seconds needed to fit the first 30 models
+system.time(
+ 
+  model_list <- purrr::map(
+  var_list[1:30],
+~ glm(formula(paste('is_recid ~', paste(.x[-1], collapse = '+'))), 
+    data = data_train, 
+    family = binomial(link = 'logit')
+    )   
+) 
+)
+```
+
+```{r}
+# 30 seconds for train AUC
+# 10 seconds for test AUC
+
+system.time(
+
+  train_auc <- purrr::map(model_list, ~auc(roc(data_train$is_recid, predict(.x, data_train)))  )  
+)
+
+system.time(
+  
+  test_auc <- purrr::map(model_list, ~auc(roc(data_test$is_recid, predict(.x, data_test)))  )  
+  
+)
+
+```
+
+```{r}
+train_auc = purrr::map_dbl(train_auc, ~ .x)
+test_auc = purrr::map_dbl(test_auc, ~ .x)
+var_ct = purrr::map_dbl(var_list[1:30], ~ length(.x))
+
+```
+
+# Plot training and test AUC LASSO path as a function of # of variables
+```{r}
+#pdf("fig_lasso_logit_auc.pdf", width = 7, height = 5)
+
+ggplot(data = data.frame(var_ct, train_auc, test_auc), mapping = aes(x = var_ct)) +
+      geom_line(aes(y = test_auc, color = "Test AUC"), size = 1) +
+      geom_line(aes(y = train_auc, color = "Train AUC"), size = 1, linetype = "dashed") +
+      labs(x = "# of variables", y = "AUC values", color = "") +
+      theme_minimal()
+#dev.off()
+```
+## Model 20 with 107 variables is picked as the optimal model with largest testing AUC
+```{r}
+data.frame(index = 1:30, 
+           cbind(train_auc, test_auc)
+           )
+# Model 21 with 107 variables
+var_ct[which.max(test_auc)]
+
+```
+
+## Check summary statistics for model 21
+```{r}
+model_optim = model_list[[21]]
+model_optim %>% summary
+
+```
+
+## Print summary statistics to LaTeX
+```{r}
+summary_model <- summary(model_optim)
+coefficients <- summary_model$coefficients
+
+# Set significance level (e.g., 0.05 for 5%)
+significance_level <- 0.05
+
+# Filter only the significant variables
+significant_coefficients <- coefficients[coefficients[, 4] < significance_level, ]
+
+# Use stargazer to print only the significant variables
+stargazer(model_optim, 
+          coef = list(significant_coefficients[, 1]),
+          type = "latex")
+```
+
+## AUC and FP/FN for symmetric classifier
+```{r}
+source('model_infer.r')
+# Merge Native American with others
+data_0$race[data_0$race == 'Native American'] = 'Other'
+
+res_reg = model_infer(X, Y, 
+                      data_0$race, 
+                      id_split, 
+                      rep(1, length(data_0$race)), 
+                      model_optim, 
+                      cx = rep(0.5, length(id_split))
+                      )
+
+res_reg$aucs
+res_reg$aucrm
+res_reg$conf_mtx
+
+fn_fp <- 1 - res_reg$conf_mtxrm$test[, 1:2]
+fp_fn <- fn_fp[, 2:1]
+fn_fp_all <- 1 - res_reg$conf_mtx$test[1:2]
+fp_fn_all <- fn_fp_all[2:1]
+results <- rbind(fp_fn, fp_fn_all)
+results <- cbind(results, c(res_reg$aucrm$test, res_reg$aucs$test))
+colnames(results) <- c('FP', 'FN', 'AUC')
+rownames(results) <- c('African-American', 'Other', 'All')
+
+stargazer(round(results, 3), type = "latex")
+
+```
+
+
+```{r}
+optim_var = names(coef(model_list[[21]]))
+formula1 = formula(paste('is_recid ~', paste(c(optim_var[-1]), collapse = '+')))
+
+```
+
+# Fit asymmetric binary choice models
+## Step 1: tune the model to get balanced false positive and false negative rates
+```{r}
+source('model_infer.r')
+
+L_1_1  = 0 # cost of true positive
+L_m1_m1 = 0 # cost of true negative
+
+res_list = list()
+
+L_m1_1_list = c(0.25, 0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 6, 7, 8, 9, 10) # cost of false negative
+L_1_m1 = 1 # cost of false positive
+  
+for (L_m1_1 in L_m1_1_list) {
+  
+  ax =  L_m1_1 - L_1_1 -  (L_1_m1 - L_m1_m1)
+  
+  bx =  L_m1_1 - L_1_1 + L_1_m1 - L_m1_m1
+  
+  cx = (L_1_m1 - L_m1_m1) / (L_1_m1 - L_m1_m1 + L_m1_1 - L_1_1)
+  
+  w = (ifelse(data_0$is_recid == 1, 1, -1) )*ax + bx
+  
+  w_train = w[!id_split]
+  
+  w_test = w[id_split]
+  
+  model_optim_weight1 = glm(
+                    formula1, 
+                    data = data_train, 
+                    family = binomial(link = 'logit'),
+                    weights = w_train
+                    )
+  
+  res_list[[length(res_list) + 1]] = model_infer(X, Y, data_0$race, 
+                                                 id_split, w, 
+                                                 model_optim_weight1, 
+                                                 cx = rep(0.5, length(id_split))
+                                                )
+}
+
+fpr_fnr_race = 
+do.call(
+  rbind,
+purrr::map2(res_list, L_m1_1_list, 
+           ~ data.frame(race = .x$conf_mtxrm$test[, 'Specificity'] %>% names,
+                        FN  = 1-.x$conf_mtxrm$test[, 'Sensitivity'] %>% unname, 
+                        FP = 1-.x$conf_mtxrm$test[, 'Specificity'] %>% unname, 
+                        cfn = .y)
+            )
+  
+)
+
+fpr_fnr_race
+```
+
+# We can reduce the FN rate substantially  with a modest FP price for psi=2
+```{r}
+conf_mtx_all = purrr::map_df(res_list, ~ .x$conf_mtx$test)
+fnr_fpr_all = data.frame(FN = 1-conf_mtx_all$Sensitivity, FP =  1-conf_mtx_all$Specificity, cfn = L_m1_1_list) %>% melt(id.vars = 'cfn')
+
+#pdf("fig_fp_fn_curves_logit.pdf", width = 7, height = 5)
+ggplot(data = fnr_fpr_all, mapping = aes(x = cfn, y = value, color = variable)) +
+      geom_line(size=1) + 
+      xlab('Cost of False Negative,'~psi) +
+      ylab('FP/FN Rates') + 
+      theme_minimal()
+#dev.off()
+
+
+
+```
+
+# Plot race-specific FP/FN mistakes
+```{r}
+fnr_fpr_race = 
+do.call(
+  rbind,
+purrr::map2(res_list, L_m1_1_list, 
+           ~ data.frame(race = .x$conf_mtxrm$test[, 'Specificity'] %>% names,
+                        fnr  = 1-.x$conf_mtxrm$test[, 'Sensitivity'] %>% unname, 
+                        fpr = 1-.x$conf_mtxrm$test[, 'Specificity'] %>% unname, 
+                        cfnr = .y)
+            )
+  
+)
+
+#pdf("fig_fn_race_logit.pdf", width = 7, height = 5)
+
+ggplot(data = fnr_fpr_race, mapping = aes(x = cfnr, y = fnr, color = race)) + 
+      geom_line(size=1) + 
+      xlab('Cost of False Negative,'~psi) +
+      ylab('False Negative Rates') + 
+      theme_minimal()
+#dev.off()
+
+```
+
+```{r}
+#pdf("fig_fp_race_logit.pdf", width = 7, height = 5)
+ggplot(data = fnr_fpr_race, mapping = aes(x = cfnr, y = fpr, color = race)) + 
+      geom_line(size=1) + 
+      xlab('Cost of False Negative,'~psi) +
+      ylab('False Positive Rates') + 
+      theme_minimal()
+#dev.off()
+```
+
+## Step 2. Fit the asymmetric model to get balanced false positive and negative rates
+```{r}
+formula2 = formula(paste('is_recid ~', paste(c(c(optim_var[-1]), 'af_ind'), collapse = '+')))
+source('model_infer.r')
+
+L_1_1  = 0 # cost of true positive
+L_1_m1 = 1 # cost of false positive
+L_m1_m1 = 0 # cost of true negative
+
+res_list = list()
+L_m1_1 = 2 # cost of false negative
+af_ind = (data_0$race == "African-American")
+L_m1_1_v = rep(L_m1_1, dim(data_0)[1])*ifelse(af_ind == TRUE, 1, 1)
+L_1_m1_v = rep(L_1_m1, dim(data_0)[1])*ifelse(af_ind == TRUE, 1, 1) # 1.9 equalizes
+
+ax =  L_m1_1_v - L_1_1 -  (L_1_m1_v - L_m1_m1)
+bx =  L_m1_1_v - L_1_1 + L_1_m1_v - L_m1_m1
+cx = (L_1_m1_v - L_m1_m1) / (L_1_m1_v - L_m1_m1 + L_m1_1_v - L_1_1)
+w = (ifelse(data_0$is_recid == 1, 1, -1) )*ax + bx
+w_train = w[!id_split]
+w_test = w[id_split]
+
+suppressWarnings(
+  
+  model_optim_weight2 <- glm(
+                    formula2, 
+                    data = data_train, 
+                    family = binomial(link = 'logit'),
+                    weights = w_train
+                    )
+
+)
+
+res4 <- model_infer(X, Y, data_0$race, 
+                  id_split, w, 
+                  model_optim_weight2, 
+                  cx = rep(0.5, length(w))
+                  )
+
+results <- rbind(1 - res4$conf_mtxrm$test[, 2:1], 1 - res4$conf_mtx$test[2:1])
+results <- cbind(results, c(res4$aucrm$test, res4$aucs$test))
+colnames(results) <- c('FP', 'FN', 'AUC')
+rownames(results) <- c('African-American', 'Other', 'All')
+results
+
+# Print to LaTeX
+stargazer(results, type = "latex")
+```
+
+# Step 3. Fit the asymmetric model with balanced group-specific false positive rates
+```{r}
+source('model_infer.r')
+
+L_1_1  = 0 # cost of true positive
+L_1_m1 = 1 # cost of false positive
+L_m1_m1 = 0 # cost of true negative
+
+res_list2 = list()
+
+multiplier_list = seq(1.0, 2, 0.1)
+
+L_m1_1 = 2 # cost of false negative
+
+af_ind = (data_0$race == "African-American")
+
+for (multiplier in multiplier_list)
+{
+  L_m1_1_v = rep(L_m1_1, dim(data_0)[1])*ifelse(af_ind == TRUE, 1, 1)
+
+  L_1_m1_v = rep(L_1_m1, dim(data_0)[1])*ifelse(af_ind == TRUE, multiplier, 1)
+  
+  ax =  L_m1_1_v - L_1_1 -  (L_1_m1_v - L_m1_m1)
+  
+  bx =  L_m1_1_v - L_1_1 + L_1_m1_v - L_m1_m1
+  
+  cx = (L_1_m1_v - L_m1_m1) / (L_1_m1_v - L_m1_m1 + L_m1_1_v - L_1_1)
+  
+  w = (ifelse(data_0$is_recid == 1, 1, -1) )*ax + bx
+  
+  w_train = w[!id_split]
+  
+  w_test = w[id_split]
+  
+  suppressWarnings(
+    
+    model_optim_weight2 <- glm(
+                      formula2, 
+                      data = data_train, 
+                      family = binomial(link = 'logit'),
+                      weights = w_train
+                      )
+  
+  )
+  
+ res_list2[[length(res_list2) + 1]] = model_infer(X, Y, data_0$race, 
+                                                id_split, w, 
+                                                model_optim_weight2, 
+                                                cx = rep(0.5, length(w))
+                                                    )
+}
+```
+# Plots
+```{r}
+tpr_tnr_race2 = 
+do.call(
+  rbind,
+purrr::map2(res_list2, multiplier_list, 
+           ~ data.frame(race = .x$conf_mtxrm$test[, 'Specificity'] %>% names,
+                        fnr  = 1-.x$conf_mtxrm$test[, 'Sensitivity'] %>% unname, 
+                        fpr = 1-.x$conf_mtxrm$test[, 'Specificity'] %>% unname, 
+                        cfnr = .y)
+            )
+  
+)
+
+#pdf("fig_equalizing_rates_fp_logit.pdf", width = 7, height = 5)
+ggplot(data = tpr_tnr_race2, mapping = aes(x = cfnr, y = fpr, color = race)) + 
+       geom_line(size=1) +
+       xlab(expression('Cost of False Positive for AF, '*varphi[1])) +
+       ylab('False Positive Rate') + 
+      theme_minimal()
+#dev.off()
+
+#pdf("fig_equalizing_rates_fn_logit.pdf", width = 7, height = 5)
+ggplot(data = tpr_tnr_race2, mapping = aes(x = cfnr, y = fnr, color = race)
+       ) + geom_line(size=1) +
+       xlab(expression('Cost of False Positive for AF, '*varphi[1])) +
+       ylab('False Negative Rate') + 
+      theme_minimal()
+#dev.off()
+
+
+```
