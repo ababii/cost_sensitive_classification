@@ -1,1 +1,1 @@
-# cost_sensitive_classification
+# Cost Sensitive Classification
