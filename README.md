@@ -14,9 +14,6 @@ This replication package contains code and data for analyzing binary forecasting
 - `data/` - Dataset files
   - `data_clean.csv` - Cleaned dataset for analysis
 
-- `fig/` - Generated figures
-- `tab/` - Generated tables
-
 ## Requirements
 
 **Python packages:** numpy, pandas, matplotlib, scikit-learn, xgboost, tensorflow, keras, joblib
